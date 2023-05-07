@@ -205,7 +205,7 @@ class XMLTreeServer(object):
             resumptionToken = kw['resumptionToken']
             result, token = input_func(resumptionToken=resumptionToken)
             # unpack keywords from resumption token
-            token_kw, dummy = decodeResumptionToken(resumptionToken)
+            token_kw, dummy = decodeMarkerResumptionToken(resumptionToken)
         else:
             result, token = input_func(**kw)
             # if we don't get results for the first request,
@@ -351,6 +351,16 @@ class BatchingServer(ServerBase):
             BatchingResumption(server, resumption_batch_size),
             metadata_registry,
             nsmap)
+        
+class MarkerServer(ServerBase):
+    """Expects to be initialized with a IBatchingOAI server implementation.
+    """
+    def __init__(self, server, metadata_registry=None, nsmap=None,
+                 resumption_batch_size=10):
+        super(MarkerServer, self).__init__(
+            MarkerResumption(server, resumption_batch_size),
+            metadata_registry,
+            nsmap)
 
 class Resumption(common.ResumptionOAIPMH):
     """
@@ -442,7 +452,38 @@ class BatchingResumption(common.ResumptionOAIPMH):
                 resumptionToken = None
             return result, resumptionToken
         return method(**kw)
-    
+
+
+class MarkerResumption(common.ResumptionOAIPMH):
+    """
+    The MarkerResumption class can turn a IMarkingOAIPMH interface into
+    a ResumptionOAIPMH interface.
+    """
+
+    def __init__(self, server, batch_size=10):
+        self._server = server
+        self._batch_size = batch_size
+
+    def handleVerb(self, verb, kw):
+        if 'resumptionToken' in kw:
+            kw, marker = decodeMarkerResumptionToken(
+                kw['resumptionToken'])
+            kw['marker'] = marker
+
+        method = common.getMethodForVerb(self._server, verb)
+
+        # now handle resumption system
+        if verb in ['ListSets', 'ListIdentifiers', 'ListRecords']:
+            kw = kw.copy()
+            kw['batch_size'] = self._batch_size
+            result, marker = method(**kw)
+            result = list(result)
+            resumptionToken = encodeMarkerResumptionToken(kw, marker) \
+                if marker else None
+            return result, resumptionToken
+        return method(**kw)
+
+
 def encodeResumptionToken(kw, cursor):
     kw = kw.copy()
     kw['cursor'] = str(cursor)
@@ -453,6 +494,43 @@ def encodeResumptionToken(kw, cursor):
     if until is not None:
         kw['until'] = datetime_to_datestamp(until)
     return quote(urlencode(kw))
+
+
+def encodeMarkerResumptionToken(kw, marker):
+    kw = kw.copy()
+    kw['marker'] = marker
+    from_ = kw.get('from_')
+    if from_ is not None:
+        kw['from_'] = datetime_to_datestamp(from_)
+    until = kw.get('until')
+    if until is not None:
+        kw['until'] = datetime_to_datestamp(until)
+    return quote(urlencode(kw))
+
+
+def decodeMarkerResumptionToken(token):
+    token = str(unquote(token))
+
+    try:
+        kw = parse_qs(token, True, True)
+    except ValueError:
+        raise error.BadResumptionTokenError(
+              "Unable to decode resumption token: %s" % token)
+    result = {}
+    for key, value in kw.items():
+        value = value[0]
+        if key == 'from_' or key == 'until':
+            value = datestamp_to_datetime(value)
+        result[key] = value
+
+    try:
+        marker = result.pop('marker')
+    except (KeyError):
+        raise error.BadResumptionTokenError(
+              "Unable to decode resumption token (no marker): %s" % token)
+
+    return result, marker
+
 
 def decodeResumptionToken(token):
     token = str(unquote(token))
